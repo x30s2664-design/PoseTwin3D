@@ -4,10 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#061018">
-<title>PoseTwin Unified v3.1</title>
+<title>PoseTwin Unified v4</title>
 
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.152.2/build/three.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.152.2/examples/js/controls/OrbitControls.js"></script>
 
@@ -66,7 +67,7 @@ h1{margin:0;font-size:clamp(28px,3vw,42px);line-height:1}
   <div class="top">
     <div class="topRow">
       <div>
-        <h1>PoseTwin <span class="version">Unified v3.1 Fix</span></h1>
+        <h1>PoseTwin <span class="version">Unified v4 · MoveNet Fix</span></h1>
         <p class="subtitle">單一 HTML · 共用一張圖片與同一組辨識結果 · 四種分析模式</p>
       </div>
       <span class="badge">Spatial / Cylinder / PPS / Vicon-like 3D</span>
@@ -105,10 +106,10 @@ h1{margin:0;font-size:clamp(28px,3vw,42px);line-height:1}
     <div class="side">
       <div class="card section">
         <h2>共用辨識</h2>
-        <div class="ctrl"><label>YOLO 人物門檻 <output id="oThreshold">0.15</output></label><input id="threshold" type="range" min="0.05" max="0.45" step="0.01" value="0.15"></div>
+        <div class="ctrl"><label>人物門檻 <output id="oThreshold">0.12</output></label><input id="threshold" type="range" min="0.05" max="0.45" step="0.01" value="0.12"></div>
         <label class="check"><input id="tileScan" type="checkbox" checked> 人物不足時 2×2 重掃描</label>
         <label class="check"><input id="showPose" type="checkbox" checked> 顯示 2D 骨架</label>
-        <div class="note">v3.1：YOLO Pose 若沒有回傳人物，會自動改用 COCO-SSD person，並逐人 crop 再嘗試 YOLO Pose。即使只有人物框，Cylinder / Spatial / 3D 站位仍會顯示結果。</div>
+        <div class="note">v4：主偵測改為官方 MoveNet MultiPose。若漏人，會用 2×2 分區掃描與 COCO-SSD person 補人，再以人物 crop 重新估姿態。即使只有人物框，Cylinder / Spatial / PPS / 3D 仍會有 fallback 結果。</div>
         <div class="metrics">
           <div class="metric"><b id="mPeople">0</b><span>球員</span></div>
           <div class="metric"><b id="mBall">—</b><span>球</span></div>
@@ -165,7 +166,7 @@ h1{margin:0;font-size:clamp(28px,3vw,42px);line-height:1}
     </div>
   </div>
 
-  <div class="footer">PoseTwin Unified v3.1 · Single HTML entry · Shared detection across all modes</div>
+  <div class="footer">PoseTwin Unified v4 · Single HTML entry · Shared detection across all modes</div>
 </div>
 
 <img id="img" alt="" style="display:none">
@@ -178,7 +179,9 @@ const NAMES=['nose','left_eye','right_eye','left_ear','right_ear','left_shoulder
 const LINKS=[[5,6],[5,7],[7,9],[6,8],[8,10],[5,11],[6,12],[11,12],[11,13],[13,15],[12,14],[14,16]];
 const SPORTS={volleyball:{w:9,l:18,net:2.43},badminton:{w:6.1,l:13.4,net:1.55},basketball:{w:15,l:28,net:0}};
 const S={
-  mode:'spatial',yolo:null,coco:null,yoloReady:false,cocoReady:false,ready:false,source:null,people:[],ball:null,threshold:.15,analyzing:false,pendingAnalyze:false,detectorSource:'—',
+  mode:'spatial',
+  moveNet:null,coco:null,moveNetReady:false,cocoReady:false,ready:false,
+  source:null,people:[],ball:null,threshold:.12,analyzing:false,pendingAnalyze:false,detectorSource:'—',
   horizon:.43,floor:.95,topW:.50,bottomW:.92,calibration:null,calibClicks:[],calibrating:false,manualBall:false,
   cylR:1,cylH:1.04,ellipse:.26,cylA:.16,
   ppsBase:.18,ppsHead:1.4,ppsHand:1.75,ppsTorso:1.05,ppsLimb:.9,ppsFoot:1.2,
@@ -197,57 +200,159 @@ function foot(p){const a=kp(p,15,.12),b=kp(p,16,.12);if(a&&b)return{x:(a.x+b.x)/
 function poseScore(p){if(Number.isFinite(p?.score))return p.score;const s=(p.keypoints||[]).map(k=>k.score).filter(Number.isFinite).sort((a,b)=>b-a);return s.length?s.slice(0,10).reduce((x,y)=>x+y,0)/Math.min(10,s.length):0}
 function label(t,x,y,c='#fff'){ctx.save();ctx.font=`700 ${Math.max(13,canvas.width/95)}px system-ui`;ctx.strokeStyle='rgba(0,0,0,.8)';ctx.lineWidth=4;ctx.fillStyle=c;ctx.strokeText(t,x,y);ctx.fillText(t,x,y);ctx.restore()}
 
-function preprocess(src){let scale=1;const input=tf.tidy(()=>{const im=tf.browser.fromPixels(src),[h,w]=im.shape.slice(0,2),m=Math.max(w,h);scale=m/YOLO_SIZE;return tf.image.resizeBilinear(im.pad([[0,m-h],[0,m-w],[0,0]]),[YOLO_SIZE,YOLO_SIZE],true).toFloat().div(255).expandDims(0)});return{input,scale}}
-async function detectPeople(src,threshold=S.threshold,maxDet=30){
-  if(!S.yolo)return[];
-  const {w:W,h:H}=size(src),{input,scale}=preprocess(src);let pred=null,tr=null,boxes=null,scores=null,kps=null,nms=null;
-  try{
-    pred=S.yolo.execute(input);if(Array.isArray(pred))pred=pred[0];tr=pred.transpose([0,2,1]);
-    boxes=tf.tidy(()=>{const w=tr.slice([0,0,2],[-1,-1,1]),h=tr.slice([0,0,3],[-1,-1,1]),x1=tf.sub(tr.slice([0,0,0],[-1,-1,1]),tf.div(w,2)),y1=tf.sub(tr.slice([0,0,1],[-1,-1,1]),tf.div(h,2));return tf.concat([y1,x1,tf.add(y1,h),tf.add(x1,w)],2).squeeze([0])});
-    scores=tr.slice([0,0,4],[-1,-1,1]).squeeze([0,2]);kps=tr.slice([0,0,5],[-1,-1,51]).squeeze([0]);
-    nms=await tf.image.nonMaxSuppressionAsync(boxes,scores,maxDet,.45,Math.max(.03,threshold));const ids=Array.from(await nms.data());if(!ids.length)return[];
-    const ba=await boxes.gather(nms).array(),sa=await scores.gather(nms).array(),ka=await kps.gather(nms).array(),out=[];
-    for(let i=0;i<ids.length;i++){let[y1,x1,y2,x2]=ba[i];x1*=scale;x2*=scale;y1*=scale;y2*=scale;x1=clamp(x1,0,W);x2=clamp(x2,0,W);y1=clamp(y1,0,H);y2=clamp(y2,0,H);if(x2-x1<8||y2-y1<18)continue;
-      const flat=ka[i],keypoints=[];let good=0;for(let j=0;j<17;j++){const x=(flat[j*3]||0)*scale,y=(flat[j*3+1]||0)*scale,sc=flat[j*3+2]||0;if(sc>=.18&&x>=0&&x<=W&&y>=0&&y<=H)good++;keypoints.push({x:clamp(x,0,W),y:clamp(y,0,H),score:sc,name:NAMES[j]})}
-      out.push({score:sa[i]||0,keypoints,poseQuality:good,box:{x:x1,y:y1,w:x2-x1,h:y2-y1},fallback:false})
-    }return out;
-  }finally{tf.dispose([input,pred,tr,boxes,scores,kps,nms])}
+
+function boxFromKeypoints(keypoints){
+  const pts=(keypoints||[]).filter(k=>(k.score??0)>=.08 && Number.isFinite(k.x) && Number.isFinite(k.y));
+  if(!pts.length)return null;
+  const xs=pts.map(k=>k.x),ys=pts.map(k=>k.y);
+  const x=Math.min(...xs),y=Math.min(...ys),x2=Math.max(...xs),y2=Math.max(...ys);
+  const padX=Math.max(8,(x2-x)*.10),padY=Math.max(10,(y2-y)*.08);
+  return {x:x-padX,y:y-padY,w:(x2-x)+padX*2,h:(y2-y)+padY*2};
 }
-function iou(a,b){const x1=Math.max(a.x,b.x),y1=Math.max(a.y,b.y),x2=Math.min(a.x+a.w,b.x+b.w),y2=Math.min(a.y+a.h,b.y+b.h),iw=Math.max(0,x2-x1),ih=Math.max(0,y2-y1),inter=iw*ih,uni=a.w*a.h+b.w*b.h-inter;return uni>0?inter/uni:0}
-function dedupe(arr){const out=[];for(const p of [...arr].sort((a,b)=>poseScore(b)-poseScore(a))){if(out.some(q=>iou(p.box,q.box)>.35))continue;out.push(p);if(out.length>=18)break}return out}
-async function tilePeople(src){const {w:W,h:H}=size(src),all=[];for(let ry=0;ry<2;ry++)for(let cx=0;cx<2;cx++){const bw=W/2,bh=H/2,o=.13,x=Math.max(0,cx*bw-bw*o),y=Math.max(0,ry*bh-bh*o),x2=Math.min(W,(cx+1)*bw+bw*o),y2=Math.min(H,(ry+1)*bh+bh*o),tw=x2-x,th=y2-y,c=document.createElement('canvas');c.width=Math.round(tw);c.height=Math.round(th);c.getContext('2d').drawImage(src,x,y,tw,th,0,0,c.width,c.height);for(const p of await detectPeople(c,Math.max(.05,S.threshold*.78),20)){p.keypoints=p.keypoints.map(k=>({...k,x:x+k.x*tw/c.width,y:y+k.y*th/c.height}));p.box={x:x+p.box.x*tw/c.width,y:y+p.box.y*th/c.height,w:p.box.w*tw/c.width,h:p.box.h*th/c.height};all.push(p)}}return all}
-async function detectCocoPersons(src){
-  if(!S.coco)return[];
-  const preds=await S.coco.detect(src,40,.12);
-  return preds.filter(p=>p.class==='person').map(p=>{
-    const b=p.bbox;
-    return {score:p.score||0,keypoints:[],poseQuality:0,fallback:true,box:{x:b[0],y:b[1],w:b[2],h:b[3]}};
-  }).filter(p=>p.box.w>10&&p.box.h>24);
+function normalizeMoveNetPose(pose){
+  const keypoints=(pose.keypoints||[]).map((k,i)=>({
+    x:k.x,y:k.y,score:k.score??0,name:k.name||NAMES[i]
+  }));
+  let b=null;
+  if(pose.box){
+    const q=pose.box;
+    const x=Number.isFinite(q.xMin)?q.xMin:(q.x??0);
+    const y=Number.isFinite(q.yMin)?q.yMin:(q.y??0);
+    const w=Number.isFinite(q.width)?q.width:
+      (Number.isFinite(q.xMax)?q.xMax-x:0);
+    const h=Number.isFinite(q.height)?q.height:
+      (Number.isFinite(q.yMax)?q.yMax-y:0);
+    if(w>0&&h>0)b={x,y,w,h};
+  }
+  b=b||boxFromKeypoints(keypoints);
+  if(!b)return null;
+  const {w:W,h:H}=size(S.source||img);
+  b.x=clamp(b.x,0,W); b.y=clamp(b.y,0,H);
+  b.w=clamp(b.w,1,Math.max(1,W-b.x)); b.h=clamp(b.h,1,Math.max(1,H-b.y));
+  return {
+    score:pose.score??poseScore({keypoints}),
+    keypoints,
+    poseQuality:keypoints.filter(k=>(k.score??0)>=.15).length,
+    box:b,
+    fallback:false,
+    source:'MoveNet'
+  };
+}
+async function detectMoveNet(src,maxPoses=6){
+  if(!S.moveNet)return[];
+  const poses=await S.moveNet.estimatePoses(src,{maxPoses,flipHorizontal:false});
+  return poses.map(normalizeMoveNetPose).filter(Boolean)
+    .filter(p=>(p.score??0)>=Math.max(.02,S.threshold*.45) || p.poseQuality>=4);
+}
+function iou(a,b){
+  const x1=Math.max(a.x,b.x),y1=Math.max(a.y,b.y),x2=Math.min(a.x+a.w,b.x+b.w),y2=Math.min(a.y+a.h,b.y+b.h);
+  const iw=Math.max(0,x2-x1),ih=Math.max(0,y2-y1),inter=iw*ih,uni=a.w*a.h+b.w*b.h-inter;
+  return uni>0?inter/uni:0
+}
+function dedupe(arr,maxN=24){
+  const out=[];
+  for(const p of [...arr].sort((a,b)=>(b.score??0)-(a.score??0))){
+    const pc={x:p.box.x+p.box.w/2,y:p.box.y+p.box.h/2};
+    const dup=out.some(q=>{
+      const qc={x:q.box.x+q.box.w/2,y:q.box.y+q.box.h/2};
+      return iou(p.box,q.box)>.34 ||
+        (iou(p.box,q.box)>.10 && dist(pc,qc)<Math.min(p.box.h,q.box.h)*.22);
+    });
+    if(!dup)out.push(p);
+    if(out.length>=maxN)break;
+  }
+  return out;
 }
 function cropForBox(src,b,pad=.18){
   const {w:W,h:H}=size(src),px=b.w*pad,py=b.h*pad;
   const x=Math.max(0,b.x-px),y=Math.max(0,b.y-py),x2=Math.min(W,b.x+b.w+px),y2=Math.min(H,b.y+b.h+py);
-  const c=document.createElement('canvas');c.width=Math.max(160,Math.round(x2-x));c.height=Math.max(160,Math.round(y2-y));
+  const c=document.createElement('canvas');
+  c.width=Math.max(160,Math.round(x2-x)); c.height=Math.max(160,Math.round(y2-y));
   c.getContext('2d').drawImage(src,x,y,x2-x,y2-y,0,0,c.width,c.height);
   return{canvas:c,x,y,w:x2-x,h:y2-y};
 }
-async function refineCocoWithYolo(src,persons){
+async function tileMoveNet(src){
+  const {w:W,h:H}=size(src),all=[];
+  for(let ry=0;ry<2;ry++)for(let cx=0;cx<2;cx++){
+    const bw=W/2,bh=H/2,o=.14;
+    const x=Math.max(0,cx*bw-bw*o),y=Math.max(0,ry*bh-bh*o);
+    const x2=Math.min(W,(cx+1)*bw+bw*o),y2=Math.min(H,(ry+1)*bh+bh*o);
+    const tw=x2-x,th=y2-y,c=document.createElement('canvas');
+    c.width=Math.max(180,Math.round(tw)); c.height=Math.max(180,Math.round(th));
+    c.getContext('2d').drawImage(src,x,y,tw,th,0,0,c.width,c.height);
+    let poses=[];
+    try{poses=await S.moveNet.estimatePoses(c,{maxPoses:6,flipHorizontal:false})}catch(e){console.warn('tile MoveNet failed',e)}
+    for(const pose of poses){
+      const keypoints=(pose.keypoints||[]).map((k,i)=>({
+        x:x+k.x*tw/c.width,y:y+k.y*th/c.height,score:k.score??0,name:k.name||NAMES[i]
+      }));
+      let b=boxFromKeypoints(keypoints);
+      if(!b)continue;
+      all.push({score:pose.score??0,keypoints,poseQuality:keypoints.filter(k=>(k.score??0)>=.15).length,box:b,fallback:false,source:'MoveNet tile'});
+    }
+  }
+  return all;
+}
+async function detectCocoPersons(src){
+  if(!S.coco)return[];
+  const preds=await S.coco.detect(src,50,.10);
+  return preds.filter(p=>p.class==='person').map(p=>{
+    const b=p.bbox;
+    return {score:p.score||0,keypoints:[],poseQuality:0,fallback:true,source:'COCO person',box:{x:b[0],y:b[1],w:b[2],h:b[3]}};
+  }).filter(p=>p.box.w>10&&p.box.h>24);
+}
+async function refineCocoWithMoveNet(src,persons){
   const out=[];
   for(const p of persons){
     let chosen=null;
     try{
-      const cr=cropForBox(src,p.box,.20),poses=await detectPeople(cr.canvas,.03,5);
+      const cr=cropForBox(src,p.box,.18);
+      const poses=await S.moveNet.estimatePoses(cr.canvas,{maxPoses:2,flipHorizontal:false});
       if(poses.length){
-        chosen=poses.sort((a,b)=>poseScore(b)-poseScore(a))[0];
-        chosen.keypoints=(chosen.keypoints||[]).map(k=>({...k,x:cr.x+k.x*cr.w/cr.canvas.width,y:cr.y+k.y*cr.h/cr.canvas.height}));
-        const bb=chosen.box;
-        chosen.box={x:cr.x+bb.x*cr.w/cr.canvas.width,y:cr.y+bb.y*cr.h/cr.canvas.height,w:bb.w*cr.w/cr.canvas.width,h:bb.h*cr.h/cr.canvas.height};
-        chosen.fallback=false;
+        const pose=[...poses].sort((a,b)=>(b.score??0)-(a.score??0))[0];
+        const keypoints=(pose.keypoints||[]).map((k,i)=>({
+          x:cr.x+k.x*cr.w/cr.canvas.width,
+          y:cr.y+k.y*cr.h/cr.canvas.height,
+          score:k.score??0,name:k.name||NAMES[i]
+        }));
+        const b=boxFromKeypoints(keypoints)||p.box;
+        chosen={score:pose.score??p.score,keypoints,poseQuality:keypoints.filter(k=>(k.score??0)>=.15).length,box:b,fallback:false,source:'COCO→MoveNet crop'};
       }
-    }catch(e){console.warn('crop YOLO refine failed',e)}
+    }catch(e){console.warn('COCO crop MoveNet failed',e)}
     out.push(chosen||p);
   }
   return out;
+}
+async function detectPeopleRobust(src){
+  let people=[],label='MoveNet MultiPose';
+  if(S.moveNet){
+    try{
+      people=dedupe(await detectMoveNet(src,6));
+      if($('#tileScan').checked && people.length<8){
+        const tiles=await tileMoveNet(src);
+        people=dedupe(people.concat(tiles));
+        if(tiles.length)label='MoveNet MultiPose + tiles';
+      }
+    }catch(e){console.warn('MoveNet full image failed',e)}
+  }
+
+  // Use COCO not only when MoveNet is zero, but also to recover missed distant/occluded people.
+  if(S.coco){
+    try{
+      const coco=dedupe(await detectCocoPersons(src));
+      const missing=coco.filter(cp=>!people.some(mp=>iou(cp.box,mp.box)>.28));
+      if(missing.length){
+        const refined=S.moveNet?await refineCocoWithMoveNet(src,missing):missing;
+        people=dedupe(people.concat(refined));
+        label=people.some(p=>p.source==='COCO→MoveNet crop')?'MoveNet + COCO→MoveNet':'MoveNet + COCO';
+      }
+      if(!people.length && coco.length){
+        people=S.moveNet?await refineCocoWithMoveNet(src,coco):coco;
+        label=people.some(p=>!p.fallback)?'COCO→MoveNet crop':'COCO person';
+      }
+    }catch(e){console.warn('COCO person fallback failed',e)}
+  }
+  return{people:dedupe(people),label};
 }
 
 async function detectBall(src){if(!S.coco)return null;const preds=await S.coco.detect(src,20,.15),balls=preds.filter(p=>p.class==='sports ball').sort((a,b)=>b.score-a.score);if(!balls.length)return null;const b=balls[0].bbox;return{x:b[0]+b[2]/2,y:b[1]+b[3]/2,score:balls[0].score,manual:false}}
@@ -263,7 +368,7 @@ function summarize(){
   const coords=S.people.map((p,i)=>({id:'P'+(i+1),p,pt:toCourt(foot(p).x,foot(p).y)}));let pair=null;
   for(let i=0;i<coords.length;i++)for(let j=i+1;j<coords.length;j++){const d=dist(coords[i].pt,coords[j].pt);if(!pair||d<pair.d)pair={a:coords[i],b:coords[j],d}}
   let ballRel=null;if(S.ball){const bp=toCourt(S.ball.x,S.ball.y);for(const c of coords){const d=dist(c.pt,bp);if(!ballRel||d<ballRel.d)ballRel={c,d}}}
-  const items=[];if(coords.length)items.push({b:`已定位 ${coords.length} 位球員`,s:'共享同一組 YOLO Pose 結果。'});if(pair)items.push({b:`最近球員：${pair.a.id} ↔ ${pair.b.id}`,s:`平面距離約 ${pair.d.toFixed(2)} m。`});if(ballRel)items.push({b:`球平面投影最近：${ballRel.c.id}`,s:`約 ${ballRel.d.toFixed(2)} m。`});
+  const items=[];if(coords.length)items.push({b:`已定位 ${coords.length} 位球員`,s:'共享同一組 MoveNet / fallback 結果。'});if(pair)items.push({b:`最近球員：${pair.a.id} ↔ ${pair.b.id}`,s:`平面距離約 ${pair.d.toFixed(2)} m。`});if(ballRel)items.push({b:`球平面投影最近：${ballRel.c.id}`,s:`約 ${ballRel.d.toFixed(2)} m。`});
   $('#summary').innerHTML=items.length?items.map(x=>`<div class="resultItem"><b>${x.b}</b><span>${x.s}</span></div>`).join(''):'<div class="resultItem"><b>沒有結果</b><span>請重新分析。</span></div>';
   $('#coordRows').innerHTML=coords.map(c=>`<tr><td>${c.id}</td><td>${c.pt.x.toFixed(2)}</td><td>${c.pt.z.toFixed(2)}</td><td>${zone(c.pt)}</td></tr>`).join('');
   return{coords,pair}
@@ -339,6 +444,15 @@ function build3D(){
 function addPerson3D(p,i){
   const base=toCourt(foot(p).x,foot(p).y),g=new THREE.Group(),h=S.personH,pts=(p.keypoints||[]),top=pts.filter(k=>(k.score??0)>.12).length?Math.min(...pts.filter(k=>(k.score??0)>.12).map(k=>k.y)):p.box.y,fy=foot(p).y,hpx=Math.max(50,fy-top),cx=p.box.x+p.box.w/2,ls=kp(p,5),rs=kp(p,6),sw=ls&&rs?Math.max(18,dist(ls,rs)):Math.max(24,p.box.w*.45),J={};
   for(let n=0;n<17;n++){const q=kp(p,n,.06);if(!q)continue;J[n]=new THREE.Vector3(base.x+clamp((q.x-cx)/sw,-1.7,1.7)*S.worldW,h*clamp((fy-q.y)/hpx,0,1.1),base.z)}
+  if(!Object.keys(J).length){
+    J[15]=new THREE.Vector3(base.x-.07,0,base.z);J[16]=new THREE.Vector3(base.x+.07,0,base.z);
+    J[13]=new THREE.Vector3(base.x-.06,h*.28,base.z);J[14]=new THREE.Vector3(base.x+.06,h*.28,base.z);
+    J[11]=new THREE.Vector3(base.x-.10,h*.54,base.z);J[12]=new THREE.Vector3(base.x+.10,h*.54,base.z);
+    J[5]=new THREE.Vector3(base.x-.15,h*.80,base.z);J[6]=new THREE.Vector3(base.x+.15,h*.80,base.z);
+    J[7]=new THREE.Vector3(base.x-.24,h*.65,base.z);J[8]=new THREE.Vector3(base.x+.24,h*.65,base.z);
+    J[9]=new THREE.Vector3(base.x-.30,h*.50,base.z);J[10]=new THREE.Vector3(base.x+.30,h*.50,base.z);
+    J[0]=new THREE.Vector3(base.x,h*.98,base.z);
+  }
   for(const[a,b]of LINKS){if(J[a]&&J[b])g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([J[a],J[b]]),new THREE.LineBasicMaterial({color:0x66e6a6})))}
   const mat=new THREE.MeshPhongMaterial({color:0xeafcff});for(const k in J){const m=new THREE.Mesh(new THREE.SphereGeometry(.045,10,10),mat);m.position.copy(J[k]);g.add(m)}
   const ring=new THREE.Mesh(new THREE.RingGeometry(.14,.20,24),new THREE.MeshBasicMaterial({color:0x44e49a,side:THREE.DoubleSide}));ring.rotation.x=-Math.PI/2;ring.position.set(base.x,.01,base.z);g.add(ring);T.world.add(g)
@@ -347,50 +461,91 @@ function resize3D(){if(!T.renderer)return;const wrap=$('#threeWrap'),w=wrap.clie
 
 async function analyze(){
   if(!S.source)return;
-  if(!S.ready){S.pendingAnalyze=true;setStatus('圖片已載入','模型仍在載入；完成後會自動分析');return;}
-  if(S.analyzing){S.pendingAnalyze=true;return;}
+  if(!S.ready){
+    S.pendingAnalyze=true;
+    setStatus('圖片已載入','模型仍在載入；完成後會自動分析');
+    return;
+  }
+  if(S.analyzing){S.pendingAnalyze=true;return}
   S.analyzing=true;S.pendingAnalyze=false;
   try{
-    setStatus('分析中…','YOLO Pose 全圖 → 2×2 → COCO person fallback');
-    let yoloPeople=[];
+    setStatus('分析中…','MoveNet MultiPose → 2×2 tiles → COCO person 補人');
+    const result=await detectPeopleRobust(S.source);
+    S.people=result.people;
+    S.detectorSource=result.label;
+
     try{
-      yoloPeople=dedupe(await detectPeople(S.source,S.threshold,30));
-      if($('#tileScan').checked&&yoloPeople.length<2)yoloPeople=dedupe(yoloPeople.concat(await tilePeople(S.source)));
-    }catch(e){console.warn('YOLO inference failed',e)}
+      const b=await detectBall(S.source);
+      if(b&&!S.ball?.manual)S.ball=b;
+    }catch(e){console.warn('ball detection failed',e)}
 
-    let people=yoloPeople,sourceLabel='YOLO Pose';
-    if(!people.length){
-      setStatus('YOLO 未找到人物','改用 COCO-SSD person fallback…');
-      const cocoPeople=dedupe(await detectCocoPersons(S.source));
-      if(cocoPeople.length){
-        people=dedupe(await refineCocoWithYolo(S.source,cocoPeople));
-        sourceLabel=people.some(p=>!p.fallback)?'COCO→YOLO crop':'COCO person';
-      }else sourceLabel='0';
-    }else if(people.some(p=>(p.poseQuality??0)<2))sourceLabel='YOLO box/pose';
+    $('#mPeople').textContent=S.people.length;
+    $('#mBall').textContent=S.ball?(S.ball.manual?'手動':'AI'):'未找到';
+    $('#mSource').textContent=result.label;
+    $('#mFallback').textContent=S.people.filter(p=>p.fallback).length;
+    render2D();
+    if(S.mode==='world')build3D();
 
-    S.people=people;S.detectorSource=sourceLabel;
-    try{const b=await detectBall(S.source);if(b&&!S.ball?.manual)S.ball=b}catch(e){console.warn('ball detection failed',e)}
-    $('#mPeople').textContent=S.people.length;$('#mBall').textContent=S.ball?(S.ball.manual?'手動':'AI'):'未找到';
-    $('#mSource').textContent=sourceLabel;$('#mFallback').textContent=S.people.filter(p=>p.fallback).length;
-    render2D();if(S.mode==='world')build3D();
-    if(S.people.length)setStatus(`完成：${S.people.length} 人${S.ball?' + 球':''}`,`${sourceLabel}；可直接切換四種模式`);
-    else setStatus('仍未找到人物','YOLO 與 COCO person 都沒有結果；請改用 localhost / GitHub Pages，或確認模型已載入。');
-  }catch(e){console.error(e);setStatus('分析失敗',`${e.name||'Error'}: ${e.message||e}`)}
-  finally{S.analyzing=false;if(S.pendingAnalyze&&S.source){S.pendingAnalyze=false;setTimeout(()=>analyze(),0)}}
+    if(S.people.length){
+      setStatus(`完成：${S.people.length} 人${S.ball?' + 球':''}`,
+        `${result.label}；四個模式共用同一組人物資料`);
+    }else{
+      setStatus('仍未找到人物',
+        'MoveNet 與 COCO person 都沒有結果。請重新載入頁面後再試，或確認瀏覽器沒有封鎖 tfhub / jsDelivr。');
+    }
+  }catch(e){
+    console.error(e);
+    setStatus('分析失敗',`${e.name||'Error'}: ${e.message||e}`);
+  }finally{
+    S.analyzing=false;
+    if(S.pendingAnalyze&&S.source){
+      S.pendingAnalyze=false;
+      setTimeout(()=>analyze(),0);
+    }
+  }
 }
 async function init(){
   init3D();
   try{
     await tf.setBackend('webgl');await tf.ready();
-    setStatus('載入 YOLOv8 Pose…','人物姿態模型');
-    try{S.yolo=await tf.loadGraphModel(YOLO_MODEL,{onProgress:p=>setStatus('載入 YOLOv8 Pose…',`下載 ${Math.round(p*100)}%`)});S.yoloReady=true}catch(e){console.warn('YOLO load failed',e);S.yoloReady=false}
+
+    setStatus('載入 MoveNet MultiPose…','官方 TensorFlow.js 多人姿態模型');
+    try{
+      S.moveNet=await poseDetection.createDetector(
+        poseDetection.SupportedModels.MoveNet,
+        {
+          modelType:poseDetection.movenet.modelType.MULTIPOSE_LIGHTNING,
+          enableTracking:false
+        }
+      );
+      S.moveNetReady=true;
+    }catch(e){
+      console.warn('MoveNet load failed',e);
+      S.moveNetReady=false;
+    }
+
     setStatus('載入 COCO-SSD…','person + sports ball fallback');
-    try{S.coco=await cocoSsd.load({base:'lite_mobilenet_v2'});S.cocoReady=true}catch(e){console.warn('COCO load failed',e);S.cocoReady=false}
-    S.ready=S.yoloReady||S.cocoReady;
-    if(!S.ready){setStatus('模型載入失敗','YOLO 與 COCO 都無法載入；請改用 localhost / GitHub Pages。');return;}
-    setStatus('AI 已就緒',`YOLO: ${S.yoloReady?'OK':'失敗'} · COCO: ${S.cocoReady?'OK':'失敗'} · 上傳圖片即可分析`);
+    try{
+      S.coco=await cocoSsd.load({base:'lite_mobilenet_v2'});
+      S.cocoReady=true;
+    }catch(e){
+      console.warn('COCO load failed',e);
+      S.cocoReady=false;
+    }
+
+    S.ready=S.moveNetReady||S.cocoReady;
+    if(!S.ready){
+      setStatus('模型載入失敗','MoveNet 與 COCO 都無法載入；請重新整理 GitHub Pages。');
+      return;
+    }
+
+    setStatus('AI 已就緒',
+      `MoveNet: ${S.moveNetReady?'OK':'失敗'} · COCO: ${S.cocoReady?'OK':'失敗'} · 上傳圖片即可分析`);
     if(S.source||S.pendingAnalyze)await analyze();
-  }catch(e){console.error(e);setStatus('初始化失敗',`${e.name||'Error'}: ${e.message||e}`)}
+  }catch(e){
+    console.error(e);
+    setStatus('初始化失敗',`${e.name||'Error'}: ${e.message||e}`);
+  }
 }
 
 document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
