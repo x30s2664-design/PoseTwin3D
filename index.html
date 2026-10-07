@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
-<title>PoseTwin Lite Action PPS v3.1</title>
+<title>PoseTwin Lite Action PPS v3.2 Camera</title>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection@2.1.3/dist/pose-detection.min.js"></script>
@@ -44,8 +44,8 @@ label{display:block;font-size:12px;color:var(--muted);margin:12px 0 5px}
 <body>
 <header>
   <div>
-    <h1>PoseTwin Lite Action PPS v3.1</h1>
-    <div class="sub">完全裝置端 · 修正點擊座標 · PPS 貼合實際姿態 · 動作骨架紅線</div>
+    <h1>PoseTwin Lite Action PPS v3.2 Camera</h1>
+    <div class="sub">完全裝置端 · 圖片 + 相機模式 · 快速人體辨識 · PPS 貼合實際動作</div>
   </div>
   <span id="aiBadge" class="badge">AI loading…</span>
 </header>
@@ -54,7 +54,9 @@ label{display:block;font-size:12px;color:var(--muted);margin:12px 0 5px}
   <section class="card">
     <div class="toolbar">
       <label class="btn file">📷 上傳圖片<input id="file" type="file" accept="image/*"/></label>
-      <button id="detect" disabled>⚡ 快速辨識人體</button>
+      <button id="cameraBtn">📹 開啟相機</button>
+      <button id="flipCam" disabled>🔄 切換鏡頭</button>
+      <button id="detect" disabled>⚡ 辨識目前畫面</button>
       <button id="addP">＋ 新增球員</button>
       <button id="ball" class="warn">🏐 標記球</button>
       <button id="court">📐 四點球場</button>
@@ -62,6 +64,7 @@ label{display:block;font-size:12px;color:var(--muted);margin:12px 0 5px}
       <button id="clear">清除</button>
     </div>
     <div class="stageWrap">
+      <video id="video" playsinline muted autoplay class="hidden"></video>
       <canvas id="c" width="1280" height="720"></canvas>
     </div>
   </section>
@@ -71,6 +74,13 @@ label{display:block;font-size:12px;color:var(--muted);margin:12px 0 5px}
       <button data-mode="cylinder" class="active">圓柱體</button>
       <button data-mode="pps">PPS</button>
       <button data-mode="world">3D 球場</button>
+    </div>
+
+    <label>相機模式</label>
+    <div class="rangeRow" style="grid-template-columns:1fr">
+      <label style="margin:0;color:var(--text);display:flex;align-items:center;gap:8px">
+        <input id="liveDetect" type="checkbox" checked> 即時辨識（約每 0.9 秒）
+      </label>
     </div>
 
     <label>人體信心門檻</label>
@@ -101,28 +111,33 @@ label{display:block;font-size:12px;color:var(--muted);margin:12px 0 5px}
 
     <div class="note">
       <b>操作：</b><br>
-      1. 上傳任意排球照片後，系統會自動做一次<b>快速人體辨識</b>。<br>
-      2. 先用 COCO-SSD 快速取得人物框與腳底 Ground Point。<br>
+      1. 可上傳照片，或按「📹 開啟相機」直接使用手機/平板鏡頭。<br>
+      2. 相機模式可持續用 COCO-SSD 取得人物框與腳底 Ground Point。<br>
       3. MoveNet 只對已找到的人物 crop 做姿態精修；PPS 會沿著手臂、軀幹、腿部實際動作生成。<br>
       4. 畫面不顯示 P1/P2/P3 編號；漏人仍可按「新增球員」手動補一點。<br>
       5. 「四點球場」依序點：近左 → 近右 → 遠右 → 遠左。<br><br>
-      <b>算力全部在裝置端。</b> 黃色區域是 PPS，紅色線段是實際姿態骨架。球點選已補償 Canvas 的縮放與留白偏移。第一次開頁面需下載 TFJS、COCO-SSD 與 MoveNet 模型；推論本身使用手機/平板/電腦的 CPU/GPU。
+      <b>算力全部在裝置端。</b> 黃色區域是 PPS，紅色線段是實際姿態骨架。相機只在瀏覽器內使用，不會上傳到後端。GitHub Pages 必須以 HTTPS 開啟，瀏覽器才會允許相機。
     </div>
   </aside>
 </main>
 
 <script>
 (()=>{
-const $=s=>document.querySelector(s), c=$('#c'),ctx=c.getContext('2d');
+const $=s=>document.querySelector(s), c=$('#c'),ctx=c.getContext('2d'),video=$('#video');
 const img=new Image();
-let state={mode:'cylinder',players:[],ball:null,add:false,markBall:false,courtMode:false,court:[],history:[],detector:null,detectorReady:false,detecting:false,poseDetector:null,poseReady:false,poseLoading:false,poseRefining:false,posePending:false};
+let state={mode:'cylinder',players:[],ball:null,add:false,markBall:false,courtMode:false,court:[],history:[],detector:null,detectorReady:false,detecting:false,poseDetector:null,poseReady:false,poseLoading:false,poseRefining:false,posePending:false,cameraOn:false,stream:null,facingMode:'environment',liveTimer:null,renderRAF:null,lastLiveDetect:0};
 
+function sourceEl(){ return state.cameraOn ? video : img; }
+function sourceSize(){
+  if(state.cameraOn) return {w:video.videoWidth||1280,h:video.videoHeight||720};
+  return {w:img.naturalWidth||0,h:img.naturalHeight||0};
+}
 function fitCanvas(){
-  if(!img.naturalWidth)return;
+  const {w,h}=sourceSize(); if(!w||!h)return;
   const maxW=1600;
-  const scale=Math.min(1,maxW/img.naturalWidth);
-  c.width=Math.round(img.naturalWidth*scale);
-  c.height=Math.round(img.naturalHeight*scale);
+  const scale=Math.min(1,maxW/w);
+  c.width=Math.round(w*scale);
+  c.height=Math.round(h*scale);
 }
 function snapshot(){state.history.push(JSON.stringify({players:state.players,ball:state.ball,court:state.court}));if(state.history.length>30)state.history.shift()}
 function canvasContentRect(){
@@ -170,7 +185,8 @@ function drawPersonBox(p,i,color){
 }
 function render(){
   ctx.clearRect(0,0,c.width,c.height);
-  if(img.naturalWidth)ctx.drawImage(img,0,0,c.width,c.height);
+  const src=sourceEl();
+  if((state.cameraOn&&video.readyState>=2)||(!state.cameraOn&&img.naturalWidth))ctx.drawImage(src,0,0,c.width,c.height);
   else{
     ctx.fillStyle='#0a1118';ctx.fillRect(0,0,c.width,c.height);
     ctx.fillStyle='#7ba1b5';ctx.font='24px system-ui';ctx.textAlign='center';ctx.fillText('上傳一張排球照片開始',c.width/2,c.height/2);ctx.textAlign='left';
@@ -363,7 +379,7 @@ async function initDetector(){
     state.detector=await cocoSsd.load({base:'lite_mobilenet_v2'});
     state.detectorReady=true;
     badge.textContent='COCO-SSD ready'; st.textContent='就緒';
-    $('#detect').disabled=!img.naturalWidth;
+    $('#detect').disabled=!(img.naturalWidth||state.cameraOn);
     // Person detection is already usable; pose loads in the background.
     initPose();
   }catch(err){
@@ -407,7 +423,7 @@ async function initPose(){
 }
 function makePoseCrop(p){
   if(!p.rawBox)return null;
-  const b=p.rawBox,W=img.naturalWidth,H=img.naturalHeight;
+  const src=sourceEl(), sz=sourceSize(), b=p.rawBox, W=sz.w,H=sz.h;
   const cx=b.x+b.w/2,cy=b.y+b.h/2;
   let side=Math.max(b.h*1.12,b.w*1.75,96);
   let x=cx-side/2,y=cy-side/2;
@@ -415,7 +431,7 @@ function makePoseCrop(p){
   side=Math.min(side,W-x,H-y);
   if(side<40)return null;
   const cc=document.createElement('canvas');cc.width=256;cc.height=256;
-  cc.getContext('2d').drawImage(img,x,y,side,side,0,0,256,256);
+  cc.getContext('2d').drawImage(src,x,y,side,side,0,0,256,256);
   return {canvas:cc,x,y,side};
 }
 async function refineOnePose(p){
@@ -423,7 +439,7 @@ async function refineOnePose(p){
   const poses=await state.poseDetector.estimatePoses(crop.canvas,{flipHorizontal:false});
   if(!poses||!poses.length)return false;
   const pose=poses[0];
-  const sx=c.width/img.naturalWidth, sy=c.height/img.naturalHeight;
+  const sz=sourceSize(), sx=c.width/sz.w, sy=c.height/sz.h;
   p.pose=(pose.keypoints||[]).map(k=>({
     x:(crop.x+(k.x/256)*crop.side)*sx,
     y:(crop.y+(k.y/256)*crop.side)*sy,
@@ -456,14 +472,15 @@ async function refineAllPoses(){
 }
 
 async function detectPeople(){
-  if(!state.detectorReady||state.detecting||!img.naturalWidth)return;
+  if(!state.detectorReady||state.detecting||!sourceSize().w)return;
   state.detecting=true;
   $('#detect').disabled=true;$('#detState').textContent='辨識中';
   const t0=performance.now();
   try{
     const conf=parseFloat($('#detConf').value);
-    const preds=await state.detector.detect(img,50,conf);
-    const sx=c.width/img.naturalWidth, sy=c.height/img.naturalHeight;
+    const src=sourceEl(),sz=sourceSize();
+    const preds=await state.detector.detect(src,50,conf);
+    const sx=c.width/sz.w, sy=c.height/sz.h;
     const people=preds.filter(p=>p.class==='person').map(p=>{
       const [x,y,w,h]=p.bbox;
       const box={x:x*sx,y:y*sy,w:w*sx,h:h*sy};
@@ -495,8 +512,70 @@ async function detectPeople(){
   }
 }
 
+
+function stopCamera(){
+  if(state.liveTimer){clearInterval(state.liveTimer);state.liveTimer=null}
+  if(state.renderRAF){cancelAnimationFrame(state.renderRAF);state.renderRAF=null}
+  if(state.stream){state.stream.getTracks().forEach(t=>t.stop())}
+  state.stream=null;state.cameraOn=false;
+  video.srcObject=null;
+  $('#cameraBtn').textContent='📹 開啟相機';
+  $('#flipCam').disabled=true;
+  $('#detect').disabled=!(state.detectorReady&&img.naturalWidth);
+  c.style.cursor='default';
+  if(img.naturalWidth){fitCanvas();render()}
+}
+function cameraRenderLoop(){
+  if(!state.cameraOn)return;
+  render();
+  state.renderRAF=requestAnimationFrame(cameraRenderLoop);
+}
+function startLiveDetection(){
+  if(state.liveTimer)clearInterval(state.liveTimer);
+  state.liveTimer=setInterval(()=>{
+    if(!state.cameraOn||!$('#liveDetect').checked||!state.detectorReady||state.detecting)return;
+    detectPeople();
+  },900);
+}
+async function startCamera(){
+  stopCamera();
+  if(!navigator.mediaDevices?.getUserMedia){
+    alert('此瀏覽器不支援相機存取。');return;
+  }
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({
+      audio:false,
+      video:{
+        facingMode:{ideal:state.facingMode},
+        width:{ideal:1280},
+        height:{ideal:720}
+      }
+    });
+    state.stream=stream;state.cameraOn=true;
+    video.srcObject=stream;
+    await video.play();
+    await new Promise(r=>{
+      if(video.videoWidth)r();
+      else video.addEventListener('loadedmetadata',r,{once:true});
+    });
+    fitCanvas();
+    state.players=[];state.ball=null;state.court=[];
+    $('#cameraBtn').textContent='⏹ 關閉相機';
+    $('#flipCam').disabled=false;
+    $('#detect').disabled=!state.detectorReady;
+    render();
+    cameraRenderLoop();
+    startLiveDetection();
+    if(state.detectorReady)detectPeople();
+  }catch(err){
+    console.warn('camera failed',err);
+    alert('無法開啟相機。請確認已允許相機權限，並使用 HTTPS 或 localhost。');
+    stopCamera();
+  }
+}
+
 $('#file').addEventListener('change',e=>{
-  const f=e.target.files?.[0];if(!f)return;const url=URL.createObjectURL(f);
+  const f=e.target.files?.[0];if(!f)return;if(state.cameraOn)stopCamera();const url=URL.createObjectURL(f);
   img.onload=async()=>{
     fitCanvas();state.players=[];state.ball=null;state.court=[];render();
     $('#detect').disabled=!state.detectorReady;
@@ -504,6 +583,15 @@ $('#file').addEventListener('change',e=>{
     if(state.detectorReady) await detectPeople();
   };
   img.src=url;
+});
+$('#cameraBtn').onclick=()=>state.cameraOn?stopCamera():startCamera();
+$('#flipCam').onclick=async()=>{
+  state.facingMode=state.facingMode==='environment'?'user':'environment';
+  if(state.cameraOn)await startCamera();
+};
+$('#liveDetect').addEventListener('change',()=>{
+  if(state.cameraOn&&$('#liveDetect').checked)startLiveDetection();
+  else if(state.liveTimer){clearInterval(state.liveTimer);state.liveTimer=null}
 });
 $('#detect').onclick=()=>detectPeople();
 $('#addP').onclick=()=>{state.add=!state.add;state.markBall=false;state.courtMode=false;$('#addP').classList.toggle('active',state.add);$('#ball').classList.remove('active');$('#court').classList.remove('active')};
@@ -517,7 +605,7 @@ $('#court').onclick=()=>{state.courtMode=!state.courtMode;state.add=false;state.
 $('#undo').onclick=()=>{const s=state.history.pop();if(!s)return;const q=JSON.parse(s);state.players=q.players;state.ball=q.ball;state.court=q.court;render()};
 $('#clear').onclick=()=>{snapshot();state.players=[];state.ball=null;state.court=[];render()};
 c.addEventListener('pointerup',e=>{
-  if(!img.naturalWidth)return;const p=point(e);
+  if(!sourceSize().w)return;const p=point(e);
   if(state.add){snapshot();const h=bodyH(p.y);state.players.push({...p,box:{x:p.x-h*.18,y:p.y-h,w:h*.36,h},rawBox:null,pose:null,score:1,source:'manual'});render();return}
   if(state.markBall){
     snapshot();state.ball=p;state.markBall=false;
